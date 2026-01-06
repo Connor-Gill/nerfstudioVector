@@ -75,27 +75,85 @@ class InputDataset(Dataset):
         return len(self._dataparser_outputs.image_filenames)
 
     def get_numpy_image(self, image_idx: int) -> npt.NDArray[np.uint8]:
-        """Returns the image of shape (H, W, 3 or 4).
+    """Returns the image of shape (H, W, 3 or 4).
 
-        Args:
-            image_idx: The image index in the dataset.
-        """
-        image_filename = self._dataparser_outputs.image_filenames[image_idx]
-        if self.cache_compressed_images:
-            pil_image = Image.open(self.binary_images[image_idx])
-        else:
-            pil_image = Image.open(image_filename)
-        if self.scale_factor != 1.0:
-            width, height = pil_image.size
-            newsize = (int(width * self.scale_factor), int(height * self.scale_factor))
-            pil_image = pil_image.resize(newsize, resample=Image.Resampling.BILINEAR)
-        image = pil_to_numpy(pil_image)  # shape is (h, w) or (h, w, 3 or 4) and dtype == "uint8"
-        if len(image.shape) == 2:
-            image = image[:, :, None].repeat(3, axis=2)
-        assert len(image.shape) == 3
-        assert image.dtype == np.uint8
-        assert image.shape[2] in [3, 4], f"Image shape of {image.shape} is incorrect."
+    Args:
+        image_idx: The image index in the dataset.
+    """
+    image_filename = self._dataparser_outputs.image_filenames[image_idx]
+
+    # Vector handling: if image file is vector (SVG/PDF), evaluate it using VectorImage
+    suffix = image_filename.suffix.lower()
+    if suffix in {".svg", ".pdf"}:
+        try:
+            from nerfstudio.data.vector.vector_image import VectorImage
+        except Exception as e:
+            raise RuntimeError(
+                "Vector image support requires the vector helper. Install svgpathtools and matplotlib "
+                "(`pip install svgpathtools matplotlib`) to enable SVG/PDF support."
+            ) from e
+
+        # Determine target width/height. Prefer camera info if available, else fallback to metadata in dataparser_outputs.
+        try:
+            # dataparser_outputs.cameras may be a Cameras object with width/height arrays
+            cameras = self._dataparser_outputs.cameras
+            # try to index width/height similarly to other code paths (some cameras expose .width as tensor)
+            try:
+                w = int(cameras.width[image_idx])
+                h = int(cameras.height[image_idx])
+            except Exception:
+                # fallback: try camera object per-index
+                cam = cameras[image_idx]
+                w = int(cam.width.item())
+                h = int(cam.height.item())
+        except Exception:
+            # fallback to transforms.json frame metadata
+            try:
+                # Many dataparser outputs set transforms.json frames; attempt to find w/h there
+                meta_frame = None
+                if "frames" in getattr(self._dataparser_outputs, "metadata", {}):
+                    # not common, but try
+                    meta_frame = self._dataparser_outputs.metadata["frames"][image_idx]
+                else:
+                    # try reading transforms.json next to image filenames
+                    transforms_json = image_filename.parent / "transforms.json"
+                    if transforms_json.exists():
+                        import json
+                        mf = json.load(open(transforms_json, "r"))
+                        meta_frame = mf["frames"][image_idx]
+                if meta_frame is not None:
+                    w = int(meta_frame.get("w", 1024))
+                    h = int(meta_frame.get("h", 1024))
+                else:
+                    w, h = 1024, 1024
+            except Exception:
+                w, h = 1024, 1024
+
+        # Build VectorImage and sample every pixel (in-memory)
+        vec = VectorImage(image_filename, target_w=w, target_h=h)
+        # Prepare grid of pixel centers (x,y) for sampling. Origin = top-left; columns = x, rows = y
+        xs, ys = np.meshgrid(np.arange(0, w, dtype=np.float32), np.arange(0, h, dtype=np.float32))
+        pts = np.stack([xs.ravel(), ys.ravel()], axis=-1)  # (H*W, 2)
+        colors = vec.sample(pts, default_color=(0.0, 0.0, 0.0))  # float32 0..1
+        image = (colors.reshape((h, w, 3)) * 255.0).clip(0, 255).astype(np.uint8)
         return image
+
+    # Existing raster path (unchanged)
+    if self.cache_compressed_images:
+        pil_image = Image.open(self.binary_images[image_idx])
+    else:
+        pil_image = Image.open(image_filename)
+    if self.scale_factor != 1.0:
+        width, height = pil_image.size
+        newsize = (int(width * self.scale_factor), int(height * self.scale_factor))
+        pil_image = pil_image.resize(newsize, resample=Image.Resampling.BILINEAR)
+    image = pil_to_numpy(pil_image)  # shape is (h, w) or (h, w, 3 or 4) and dtype == "uint8"
+    if len(image.shape) == 2:
+        image = image[:, :, None].repeat(3, axis=2)
+    assert len(image.shape) == 3
+    assert image.dtype == np.uint8
+    assert image.shape[2] in [3, 4], f"Image shape of {image.shape} is incorrect."
+    return image
 
     def get_image_float32(self, image_idx: int) -> Float[Tensor, "image_height image_width num_channels"]:
         """Returns a 3 channel image in float32 torch.Tensor.
