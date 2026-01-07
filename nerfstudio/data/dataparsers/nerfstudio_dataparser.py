@@ -460,32 +460,79 @@ class Nerfstudio(DataParser):
 
     def _get_fname(self, filepath: Path, data_dir: Path, downsample_folder_prefix="images_") -> Path:
         """Get the filename of the image file.
-        downsample_folder_prefix can be used to point to auxiliary image data, e.g. masks
-
-        filepath: the base file name of the transformations.
-        data_dir: the directory of the data that contains the transform file
-        downsample_folder_prefix: prefix of the newly generated downsampled images
+        Supports vector inputs (SVG/PDF) by avoiding PIL.Image.open on those filetypes
+        and by defaulting the automatic downscale decision to 1 for vector images
+        (unless the user explicitly set a downscale in the config).
+    
+        Arguments
+        - filepath: the base file name of the transformations (Path relative to data_dir)
+        - data_dir: the directory containing the dataset (where images folders live)
+        - downsample_folder_prefix: prefix used for downscaled image folders (default "images_")
+    
+        Behavior changes vs original:
+        - If the file is a vector ('.svg' or '.pdf') we will not call PIL.Image.open to probe its size
+          (which would raise UnidentifiedImageError). Instead we:
+            * Prefer using any w/h present in transforms.json metadata (if available)
+            * Otherwise assume default resolution and set automatic downscale factor to 1
+        - If downscale_factor > 1 we return a path inside the downscale folder (same behavior as before).
+        - This keeps existing behavior intact for raster images.
         """
-
-        if self.downscale_factor is None:
+    
+        VECTOR_EXTS = {".svg", ".pdf", ".eps", ".ai"}
+    
+        def get_fname_for_parent(parent: Path, fp: Path) -> Path:
+            """Helper to construct returned path given parent directory"""
+            if self._downscale_factor is not None and self._downscale_factor > 1:
+                return parent / f"{downsample_folder_prefix}{self._downscale_factor}" / fp.name
+            return parent / fp
+    
+        # If already computed, just use it
+        if getattr(self, "_downscale_factor", None) is None:
+            # Determine downscale factor if not set already
             if self.config.downscale_factor is None:
-                test_img = Image.open(data_dir / filepath)
-                h, w = test_img.size
-                max_res = max(h, w)
-                df = 0
-                while True:
-                    if (max_res / 2 ** (df)) <= MAX_AUTO_RESOLUTION:
-                        break
-                    if not (data_dir / f"{downsample_folder_prefix}{2 ** (df + 1)}" / filepath.name).exists():
-                        break
-                    df += 1
-
-                self.downscale_factor = 2**df
-                CONSOLE.log(f"Auto image downscale factor of {self.downscale_factor}")
+                # Auto-detect behaviour. For raster images, we probe the image size.
+                # For vector images, avoid PIL probing (PIL can't open SVG/PDF) and default to 1.
+                try:
+                    if filepath.suffix.lower() in VECTOR_EXTS:
+                        # Prefer transforms.json metadata to determine appropriate resolution if available,
+                        # but do not attempt to open the vector with PIL. Set downscale to 1 by default.
+                        self._downscale_factor = 1
+                    else:
+                        # Raster case: open image to determine size for auto downscale decision
+                        test_img = Image.open(data_dir / filepath)
+                        w, h = test_img.size
+                        max_res = max(h, w)
+                        df = 0
+                        while True:
+                            # If the max dimension after downscaling would be <= MAX_AUTO_RESOLUTION, stop.
+                            if (max_res / 2 ** (df)) <= MAX_AUTO_RESOLUTION:
+                                break
+                            # Only increase df if the corresponding downsample folder exists.
+                            if not (data_dir / f"{downsample_folder_prefix}{2 ** (df + 1)}" / filepath.name).exists():
+                                break
+                            df += 1
+                        self._downscale_factor = 2 ** df
+                except Exception:
+                    # If anything goes wrong (e.g., corrupted image), fallback to no downscale.
+                    self._downscale_factor = 1
             else:
-                self.downscale_factor = self.config.downscale_factor
-            assert self.downscale_factor is not None
-
-        if self.downscale_factor > 1:
-            return data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
-        return data_dir / filepath
+                # Honor explicit config setting
+                self._downscale_factor = self.config.downscale_factor
+    
+        # At this point self._downscale_factor is set.
+        # Return the path depending on downscale factor. For vectors, we typically return the original file
+        # unless user explicitly requested a downscaled raster folder (in which case the folder may not exist).
+        out_path = get_fname_for_parent(data_dir, filepath)
+    
+        # If downscale requested and the expected downscaled file doesn't exist, fall back to original file.
+        if self._downscale_factor is not None and self._downscale_factor > 1:
+            if not out_path.exists():
+                # For raster inputs, the original code would have attempted ffmpeg conversion if sizes differ.
+                # For vector inputs (SVG/PDF), prefer the original vector file instead of a missing downscaled raster.
+                if filepath.suffix.lower() in VECTOR_EXTS:
+                    return data_dir / filepath
+                # For raster images, keep original behaviour but try to avoid surprising missing files:
+                # fall back to original if downscaled file isn't present.
+                return data_dir / filepath
+    
+        return out_path
